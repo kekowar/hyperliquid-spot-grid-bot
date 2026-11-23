@@ -7,77 +7,84 @@
 <a name="english"></a>
 ## English
 
-An open-source, non-custodial Spot Grid Trading Bot planner and order-payload generator built specifically for Hyperliquid Spot markets (`HYPE/USDC`, `UBTC/USDC`, `UETH/USDC`, `PURR/USDC`).
+An open-source, non-custodial Spot Grid Trading Bot built specifically for Hyperliquid Spot markets (`HYPE/USDC`, `UBTC/USDC`, `UETH/USDC`, `PURR/USDC`).
 
-Constructs passive maker limit orders (*Post-Only* / `Alo`) in a geometric or arithmetic price grid:
-- **Buys dips** below the reference market price.
-- **Sells rallies** above the reference market price.
+Places passive maker limit orders (*Post-Only* / `Alo`) in a structured geometric or arithmetic grid and automatically rebalances filled levels:
+- **Buys dips** below current market price; when a buy fills at level `i`, automatically posts a sell at level `i + 1`.
+- **Sells rallies** above current market price; when a sell fills at level `i`, automatically posts a buy at level `i - 1`.
 - **Zero liquidation risk & zero perp funding costs** (100% spot market).
-- **Non-custodial:** Your funds stay in your Hyperliquid wallet; private keys are never shared.
+- **Non-custodial security:** Runs locally on your machine using a Hyperliquid **API Wallet (Agent)** that can only place/cancel orders and has **zero withdrawal permissions**.
 
-> **Current status (v0.1):** Dry-run grid planner, live mid-price lookup (`--live-price`), and HIP-1 builder-fee order payload generator. Automated live execution and fill-rebalancing loop are planned for the next release.
-
-### 1. Requirements
-* Python 3.10+
-* Optional (for upcoming live execution & tests):
-  ```bash
-  pip install -r requirements.txt
-  ```
-
-### 2. Plan a Grid (Dry-Run / Simulation Mode)
-Preview your exact grid levels and capital allocation without broadcasting orders:
+### 1. Installation
 ```bash
-# Example: Geometric grid on HYPE (@107) between $50 and $80 with 8 grid levels and $100 capital
+git clone https://github.com/kekowar/hyperliquid-spot-grid-bot.git
+cd hyperliquid-spot-grid-bot
+pip install -r requirements.txt
+```
+
+### 2. Plan Your Grid (Dry-Run — No Keys Needed)
+Preview exact tick-rounded grid levels and per-order capital before risking funds:
+```bash
+# Offline simulation using midpoint
 python spot_grid_bot.py --plan --coin @107 --lower 50 --upper 80 --grids 8 --capital 100
 
-# Fetch live spot mid price directly from Hyperliquid public API
-python spot_grid_bot.py --plan --coin @107 --lower 20 --upper 60 --grids 8 --capital 100 --live-price
+# Live mid-price & szDecimals from Hyperliquid public API
+python spot_grid_bot.py --plan --coin @107 --lower 20 --upper 45 --grids 8 --capital 100 --live-price
 ```
 
-Sample output:
-```text
-==================================================================
-  HYPERLIQUID SPOT GRID BOT: @107
-==================================================================
-Current Market Price:   65.0000
-Capital Allocated:      $100.00 USD ($12.50 per order)
-Builder Fee Attached:   5 bps (f=50) -> 0x3f294e8cfc89b9f0df5608d601fbacf385e6dbec
+### 3. Live Execution Setup (2 One-Time Steps)
 
-BUY ORDERS (placed below current price):
-  [BUY]    0.2044 @    61.1575  (~$ 12.50)
-  [BUY]    0.2186 @    57.1860  (~$ 12.50)
-  [BUY]    0.2338 @    53.4724  (~$ 12.50)
-  [BUY]    0.2500 @    50.0000  (~$ 12.50)
---- CURRENT PRICE: 65.0000 ---
-SELL ORDERS (placed above current price):
-  [SELL]   0.1911 @    65.4049  (~$ 12.50)
-  [SELL]   0.1787 @    69.9471  (~$ 12.50)
-  [SELL]   0.1671 @    74.8049  (~$ 12.50)
-  [SELL]   0.1562 @    80.0000  (~$ 12.50)
-==================================================================
-```
-
-### 3. Parameters
-| Parameter | Description | Default |
-|---|---|---|
-| `--coin` | Spot pair symbol (`@107` for HYPE, `@142` for UBTC, `PURR/USDC`) | `@107` |
-| `--lower` | Lower price bound in USD | `50.0` |
-| `--upper` | Upper price bound in USD | `80.0` |
-| `--grids` | Number of grid levels | `10` |
-| `--capital` | Total USDC allocated to the grid | `100.0` |
-| `--mode` | Grid spacing (`geometric` or `arithmetic`) | `geometric` |
-| `--price` | Custom reference market price (USD) | Midpoint of range |
-| `--live-price` | Fetch live mid price from Hyperliquid `/info` L2 book | `False` |
-| `--fee-bps` | Hyperliquid Builder Fee in bps (protocol `f = fee_bps * 10`) | `5` (0.05%) |
-
-### 4. Protocol-Level Builder Fee (HIP-1)
-This software is free and open-source under the MIT License. It uses Hyperliquid's native Builder Code mechanism (`0x3f294E8CFc89B9f0Df5608D601fBaCf385E6DbEc`):
-- A 5 bps (0.05%, protocol `f=50` in tenths of a bps) fee is attached to generated orders and settled on-chain by Hyperliquid only when orders fill (after one-time user `ApproveBuilderFee` authorization).
-- No subscriptions, no custodial lock-in, completely auditable source code.
-
-### 5. Running Tests
+#### Step A: Approve the Builder Fee Once (Main Wallet)
+Hyperliquid requires every user to authorize a builder's max fee cap once via an EIP-712 `ApproveBuilderFee` signature from their **Main Wallet** (you can revoke it at any time):
 ```bash
-pytest
+export HL_MAIN_PRIVATE_KEY="0x<your_main_wallet_key>"
+python spot_grid_bot.py --approve-builder --fee-bps 5
+unset HL_MAIN_PRIVATE_KEY
+```
+
+#### Step B: Run the Grid Bot with an API Wallet (Agent — Recommended)
+Create an API Wallet in Hyperliquid (`More -> API`), then run the bot with that agent key (no withdrawal rights):
+```bash
+export HL_PRIVATE_KEY="0x<your_api_agent_private_key>"
+export HL_ACCOUNT_ADDRESS="0x<your_main_wallet_address>"
+
+python spot_grid_bot.py --run \
+  --coin @107 \
+  --lower 20 \
+  --upper 45 \
+  --grids 8 \
+  --capital 120 \
+  --poll-interval 10 \
+  --cancel-on-exit
+```
+> **Note:** Hyperliquid enforces a **$10 USDC minimum order value** on Spot. Ensure `capital / grids >= 10` and hold both USDC (for buy levels) and base asset (for sell levels) in your Spot balance.
+
+### 4. CLI Options
+| Flag | Description | Default |
+|---|---|---|
+| `--plan` | Dry-run grid preview (default mode) | `True` |
+| `--run` | Live deployment + automatic fill-rebalancing loop | `False` |
+| `--approve-builder` | One-time EIP-712 `ApproveBuilderFee` using `HL_MAIN_PRIVATE_KEY` | `False` |
+| `--check-builder` | Check HIP-1 eligibility of the builder address (`standard` mode + `>= 100 USDC` Perps) | `False` |
+| `--coin` | Spot pair symbol (`@107` HYPE, `@142` UBTC, `PURR/USDC`) | `@107` |
+| `--lower` / `--upper` | Price boundaries in USD | `50.0` / `80.0` |
+| `--grids` | Number of grid levels | `8` |
+| `--mode` | Spacing: `geometric` or `arithmetic` | `geometric` |
+| `--capital` | Total USD allocated across the grid | `100.0` |
+| `--live-price` | Fetch live mid price & `szDecimals` from Hyperliquid `/info` | `False` |
+| `--fee-bps` | Builder fee in bps (`f = fee_bps * 10` in tenths of a bps) | `5` (0.05%) |
+| `--testnet` | Run against Hyperliquid Testnet | `False` |
+| `--cancel-on-exit` | Cancel open orders for this coin on `Ctrl+C` | `False` |
+
+### 5. Protocol-Level Builder Fee (HIP-1)
+This software is free and open-source under the MIT License. It monetizes via Hyperliquid's native Builder Code (`0x3f294E8CFc89B9f0Df5608D601fBaCf385E6DbEc`):
+- Attaches `5 bps` (`0.05%`, protocol `f=50` in tenths of a bps) to generated orders.
+- Per Hyperliquid Spot protocol rules, builder fees are collected in USDC on **sell fills** only, and only after your explicit `ApproveBuilderFee` authorization.
+- Zero subscriptions, zero key exfiltration, 100% auditable code.
+
+### 6. Tests
+```bash
+pytest -v
 ```
 
 ---
@@ -85,96 +92,86 @@ pytest
 <a name="chinese"></a>
 ## 中文说明 (Chinese)
 
-专门为 Hyperliquid 现货市场（`HYPE/USDC`、`UBTC/USDC`、`UETH/USDC`、`PURR/USDC` 等）设计的开源、非托管网格交易规划与订单构建工具。
+专为 Hyperliquid 现货市场（`HYPE/USDC`、`UBTC/USDC`、`UETH/USDC`、`PURR/USDC` 等）设计的开源、非托管网格交易机器人。
 
-在价格区间内生成被动限价单（Post-Only / 只做 Maker / `Alo`）：
-- **下跌分批买入：** 在参考市价下方挂买单。
-- **反弹分批卖出：** 在参考市价上方挂卖单。
-- **无爆仓风险，无资金费率损耗：** 100% 现货市场逻辑。
-- **非托管安全：** 资金始终保存在您自己的 Hyperliquid 钱包中，私钥无需交给第三方。
+在区间内自动挂出被动限价单（Post-Only / 只做 Maker / `Alo`），并在成交后自动补挂反向网格单：
+- **下跌分批买入：** 第 `i` 格买单成交后，自动在第 `i + 1` 格挂出卖单。
+- **反弹分批卖出：** 第 `i` 格卖单成交后，自动在第 `i - 1` 格挂出买单。
+- **无爆仓风险、无资金费率损耗：** 100% 现货市场运行。
+- **非托管安全：** 在本地运行，推荐使用仅具交易权限、**无提币权限**的 Hyperliquid API Wallet（Agent 钱包）。
 
-> **当前版本 (v0.1)：** 支持 Dry-Run 网格模拟测算、Hyperliquid 实时中间价获取（`--live-price`）以及符合协议规范的 HIP-1 Builder Fee 订单载荷构建。实盘自动挂单与成交补单循环将在后续版本推出。
-
-### 1. 运行环境要求
-* Python 3.10 或更高版本
-* 安装依赖：
-  ```bash
-  pip install -r requirements.txt
-  ```
-
-### 2. 模拟测算网格分布（Dry-Run 模式）
-在不发送任何链上订单的情况下预览网格点位与资金分配：
+### 1. 安装
 ```bash
-# 示例：以 $50 到 $80 美元区间，对 HYPE（现货代码 @107）设置 8 格，投入 100 USDC
-python spot_grid_bot.py --plan --coin @107 --lower 50 --upper 80 --grids 8 --capital 100
-
-# 从 Hyperliquid 公共 API 获取实时现货中间价
-python spot_grid_bot.py --plan --coin @107 --lower 20 --upper 60 --grids 8 --capital 100 --live-price
+git clone https://github.com/kekowar/hyperliquid-spot-grid-bot.git
+cd hyperliquid-spot-grid-bot
+pip install -r requirements.txt
 ```
 
-### 3. 可选参数说明
-| 参数 | 说明 | 默认值 |
-|---|---|---|
-| `--coin` | 现货资产代号（HYPE 为 `@107`，UBTC 为 `@142`，`PURR/USDC`） | `@107` |
-| `--lower` | 网格最低价（美元） | `50.0` |
-| `--upper` | 网格最高价（美元） | `80.0` |
-| `--grids` | 网格区间层数 | `10` |
-| `--capital` | 分配给网格的总资金（USDC） | `100.0` |
-| `--mode` | 间距模式：等比 (`geometric`) 或等差 (`arithmetic`) | `geometric` |
-| `--price` | 手动指定参考市价（美元） | 区间中点 |
-| `--live-price` | 从 Hyperliquid `/info` 盘口获取实时中间价 | `False` |
-| `--fee-bps` | Hyperliquid 开发者构建费率（bps，协议字段 `f = fee_bps * 10`） | `5` (0.05%) |
+### 2. 模拟测算网格（Dry-Run，无需私钥）
+```bash
+python spot_grid_bot.py --plan --coin @107 --lower 20 --upper 45 --grids 8 --capital 100 --live-price
+```
 
-### 4. 协议原生开发者费机制（HIP-1 Builder Fee）
-本项目采用 MIT 开源协议，通过 Hyperliquid 官方原生 Builder Code 机制运作（收款地址：`0x3f294E8CFc89B9f0Df5608D601fBaCf385E6DbEc`）：
-- 默认附带 5 bps（0.05%，协议单位 `f=50` 即 0.1 bps 精度）开发者费，仅在用户完成一次性 `ApproveBuilderFee` 授权且订单实际成交时由链上自动结算。
-- 零月费、无后门、代码完全开源可审计。
+### 3. 实盘运行（仅需两步）
+1. **一次性授权 Builder Fee（需主钱包签名一次，可随时撤销）：**
+   ```bash
+   export HL_MAIN_PRIVATE_KEY="0x<你的主钱包私钥>"
+   python spot_grid_bot.py --approve-builder --fee-bps 5
+   unset HL_MAIN_PRIVATE_KEY
+   ```
+2. **使用 API/Agent 钱包运行自动网格：**
+   ```bash
+   export HL_PRIVATE_KEY="0x<API_Agent_私钥>"
+   export HL_ACCOUNT_ADDRESS="0x<主钱包地址>"
+   python spot_grid_bot.py --run --coin @107 --lower 20 --upper 45 --grids 8 --capital 120 --cancel-on-exit
+   ```
+
+### 4. 协议原生 Builder Fee（HIP-1）
+本项目采用 MIT 开源协议，通过 Hyperliquid 官方原生 Builder Code 运作（`0x3f294E8CFc89B9f0Df5608D601fBaCf385E6DbEc`）：
+- 默认附带 `5 bps`（`0.05%`，协议单位 `f=50`）开发者费，依据 Hyperliquid 现货规则仅在卖单成交时以 USDC 结算。
+- 零月费、无托管风险、代码完全开源透明。
 
 ---
 
 <a name="español"></a>
 ## Español
 
-Herramienta de código abierto y no custodial para planificar rejillas (Grid Trading) y construir órdenes *Post-Only* (`Alo`) en los mercados Spot de Hyperliquid (`HYPE/USDC`, `UBTC/USDC`, `UETH/USDC`, `PURR/USDC`).
+Bot de Grid Trading de código abierto y no custodial diseñado específicamente para los mercados Spot de Hyperliquid (`HYPE/USDC`, `UBTC/USDC`, `UETH/USDC`, `PURR/USDC`).
 
-Genera órdenes limitadas pasivas escalonadas:
-- **Compra en caídas** por debajo del precio de referencia.
-- **Vende en rebotes** por encima del precio de referencia.
+Coloca órdenes limitadas pasivas *Post-Only* (`Alo`) en una rejilla geométrica o aritmética y repone automáticamente cada nivel al ejecutarse:
+- **Compra en caídas:** cuando se llena una compra en el nivel `i`, coloca automáticamente una venta en el nivel `i + 1`.
+- **Vende en rebotes:** cuando se llena una venta en el nivel `i`, coloca automáticamente una compra en el nivel `i - 1`.
 - **Sin liquidaciones ni costes de financiación** (100% mercado Spot).
-- **No custodial:** Tus fondos permanecen en tu propia billetera de Hyperliquid.
+- **Seguridad no custodial:** corre en tu propio equipo usando una **API Wallet (Agent)** de Hyperliquid que solo puede operar y **no tiene permiso para retirar fondos**.
 
-> **Estado actual (v0.1):** Planificador en modo simulación (*dry-run*), consulta de precio medio en vivo (`--live-price`) y generador de payloads de orden con Builder Fee HIP-1. La ejecución automática en vivo y el bucle de reposición por fills llegarán en la siguiente versión.
-
-### 1. Requisitos
-* Python 3.10 o superior.
-* Instalar dependencias:
-  ```bash
-  pip install -r requirements.txt
-  ```
-
-### 2. Planificar una Rejilla (Modo Simulación / Dry-Run)
-Previsualiza la distribución exacta de niveles y capital sin enviar órdenes a la red:
+### 1. Instalación
 ```bash
-python spot_grid_bot.py --plan --coin @107 --lower 50 --upper 80 --grids 8 --capital 100
-
-# Consultar el precio medio real desde la API pública de Hyperliquid
-python spot_grid_bot.py --plan --coin @107 --lower 20 --upper 60 --grids 8 --capital 100 --live-price
+git clone https://github.com/kekowar/hyperliquid-spot-grid-bot.git
+cd hyperliquid-spot-grid-bot
+pip install -r requirements.txt
 ```
 
-### 3. Parámetros Disponibles
-| Parámetro | Descripción | Valor por Defecto |
-|---|---|---|
-| `--coin` | Identificador del par Spot (`@107` para HYPE, `@142` para UBTC, `PURR/USDC`) | `@107` |
-| `--lower` | Límite inferior de la rejilla en USD | `50.0` |
-| `--upper` | Límite superior de la rejilla en USD | `80.0` |
-| `--grids` | Número de niveles de la rejilla | `10` |
-| `--capital` | Capital total en USDC asignado al bot | `100.0` |
-| `--mode` | Distribución de niveles (`geometric` o `arithmetic`) | `geometric` |
-| `--price` | Precio de referencia manual en USD | Punto medio del rango |
-| `--live-price` | Obtener el precio medio actual desde `/info` de Hyperliquid | `False` |
-| `--fee-bps` | Comisión de constructor en bps (campo `f = fee_bps * 10`) | `5` (0.05%) |
+### 2. Simular tu Rejilla (Dry-Run, sin claves)
+```bash
+python spot_grid_bot.py --plan --coin @107 --lower 20 --upper 45 --grids 8 --capital 100 --live-price
+```
+
+### 3. Puesta en Marcha en Vivo (2 pasos)
+1. **Aprobar el Builder Fee una sola vez (con tu Main Wallet):**
+   ```bash
+   export HL_MAIN_PRIVATE_KEY="0x<clave_de_tu_main_wallet>"
+   python spot_grid_bot.py --approve-builder --fee-bps 5
+   unset HL_MAIN_PRIVATE_KEY
+   ```
+2. **Ejecutar el Grid Bot con una API Wallet (Agent sin permisos de retiro):**
+   ```bash
+   export HL_PRIVATE_KEY="0x<clave_api_agent>"
+   export HL_ACCOUNT_ADDRESS="0x<tu_direccion_main_wallet>"
+   python spot_grid_bot.py --run --coin @107 --lower 20 --upper 45 --grids 8 --capital 120 --cancel-on-exit
+   ```
+
+> **Nota:** Hyperliquid exige un mínimo de **$10 USDC por orden** en Spot (`capital / grids >= 10`).
 
 ### 4. Comisión Nativa de Constructor (HIP-1 Builder Fee)
-El software es gratuito bajo licencia MIT y utiliza el mecanismo nativo de Builder Code de Hyperliquid (`0x3f294E8CFc89B9f0Df5608D601fBaCf385E6DbEc`):
-- Cada orden incluye una comisión de 5 pb (0,05%, equivalente a `f=50` en décimas de pb según el protocolo), liquidada on-chain por Hyperliquid solo cuando la orden se ejecuta tras una única autorización `ApproveBuilderFee`.
-- Sin suscripciones ni custodia de claves.
+Software libre bajo licencia MIT que utiliza el mecanismo nativo de Hyperliquid (`0x3f294E8CFc89B9f0Df5608D601fBaCf385E6DbEc`):
+- Adjunta `5 pb` (`0,05%`, campo de protocolo `f=50`) en las órdenes. Según las reglas de Spot de Hyperliquid, se cobra en USDC únicamente al ejecutarse órdenes de venta, tras la autorización explícita `ApproveBuilderFee`.
