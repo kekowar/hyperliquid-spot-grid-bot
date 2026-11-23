@@ -1,12 +1,15 @@
 """
-Hyperliquid Spot Grid Bot (Non-Custodial) — v0.2
+Hyperliquid Spot Grid Bot (Non-Custodial) — v0.3
 ------------------------------------------------
 Open-source, non-custodial Spot Grid Trading Bot for Hyperliquid Spot markets
-(e.g. HYPE/USDC `@107`, UBTC/USDC `@142`, PURR/USDC).
+(e.g. HYPE/USDC, UBTC/USDC, UETH/USDC, PURR/USDC).
 
 Features:
-- Dry-run planner (`--plan`) with optional live mid-price lookup (`--live-price`).
+- Friendly spot pair resolution (`HYPE`, `HYPE/USDC`, or `@107` -> canonical Hyperliquid pair).
+- Dry-run planner (`--plan`) with optional live mid-price & `szDecimals` lookup (`--live-price`).
 - Hyperliquid Spot precision rounding (`szDecimals`, 5 significant figures, max `8 - szDecimals` decimals).
+- Balance-aware live deployment: if starting with 100% USDC, places BUY grid below market and
+  automatically places upper SELL orders as buys fill.
 - One-time EIP-712 Builder Fee approval (`--approve-builder`) signed by the user's Main Wallet.
 - Builder eligibility diagnostics (`--check-builder`).
 - Live non-custodial execution and automatic fill-rebalancing loop (`--run`) using an API/Agent wallet
@@ -50,7 +53,7 @@ def bps_to_max_fee_rate_str(fee_bps: int) -> str:
 
 
 def round_size(sz: float, sz_decimals: int) -> float:
-    """Round order size to the asset's exact szDecimals."""
+    """Round order size down to the asset's exact szDecimals."""
     if sz <= 0:
         return 0.0
     factor = 10 ** sz_decimals
@@ -85,29 +88,67 @@ def hl_info_post(payload: Dict[str, Any], base_url: str = HL_MAINNET_API, timeou
         return json.loads(resp.read().decode("utf-8"))
 
 
-def fetch_spot_market_info(coin: str, base_url: str = HL_MAINNET_API) -> Dict[str, Any]:
-    """Fetch spot szDecimals and current bid/ask/mid for a Hyperliquid Spot pair."""
-    meta = hl_info_post({"type": "spotMeta"}, base_url=base_url)
-    tokens = {t["index"]: t for t in meta.get("tokens", [])}
-    sz_decimals = 2
-    base_name = coin
-    for pair in meta.get("universe", []):
-        if pair.get("name") == coin:
-            base_tok = tokens.get(pair["tokens"][0], {})
-            sz_decimals = int(base_tok.get("szDecimals", 2))
-            base_name = base_tok.get("name", coin)
-            break
+def resolve_spot_pair(coin_input: str, spot_meta: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Resolve user-friendly symbols ('HYPE', 'HYPE/USDC', '@107', 'PURR/USDC')
+    into Hyperliquid's canonical spot universe name and base token metadata.
+    """
+    raw = coin_input.strip()
+    upper = raw.upper()
+    tokens = {t["index"]: t for t in spot_meta.get("tokens", [])}
 
-    l2 = hl_info_post({"type": "l2Book", "coin": coin}, base_url=base_url)
+    # 1. Exact universe name match (e.g. '@107' or 'PURR/USDC')
+    for pair in spot_meta.get("universe", []):
+        if pair.get("name", "").upper() == upper:
+            base = tokens[pair["tokens"][0]]
+            quote = tokens[pair["tokens"][1]]
+            return {
+                "coin": pair["name"],
+                "base_name": base["name"],
+                "quote_name": quote["name"],
+                "sz_decimals": int(base.get("szDecimals", 2)),
+            }
+
+    # 2. Match 'BASE/QUOTE' or 'BASE' (default quote USDC)
+    if "/" in upper:
+        want_base, want_quote = upper.split("/", 1)
+    else:
+        want_base, want_quote = upper, "USDC"
+
+    for pair in spot_meta.get("universe", []):
+        base = tokens.get(pair["tokens"][0], {})
+        quote = tokens.get(pair["tokens"][1], {})
+        if base.get("name", "").upper() == want_base and quote.get("name", "").upper() == want_quote:
+            return {
+                "coin": pair["name"],
+                "base_name": base["name"],
+                "quote_name": quote["name"],
+                "sz_decimals": int(base.get("szDecimals", 2)),
+            }
+
+    raise ValueError(
+        f"Spot pair '{coin_input}' not found on Hyperliquid. "
+        "Try e.g. 'HYPE/USDC', '@107', 'UBTC/USDC', '@142', or 'PURR/USDC'."
+    )
+
+
+def fetch_spot_market_info(coin: str, base_url: str = HL_MAINNET_API) -> Dict[str, Any]:
+    """Fetch canonical spot coin ID, szDecimals, and live bid/ask/mid."""
+    meta = hl_info_post({"type": "spotMeta"}, base_url=base_url)
+    resolved = resolve_spot_pair(coin, meta)
+    canonical_coin = resolved["coin"]
+
+    l2 = hl_info_post({"type": "l2Book", "coin": canonical_coin}, base_url=base_url)
     levels = l2.get("levels", [[], []])
     if not levels or not levels[0] or not levels[1]:
-        raise ValueError(f"Empty order book returned for {coin}")
+        raise ValueError(f"Empty order book returned for {canonical_coin}")
     bid = float(levels[0][0]["px"])
     ask = float(levels[1][0]["px"])
     return {
-        "coin": coin,
-        "base_name": base_name,
-        "sz_decimals": sz_decimals,
+        "coin": canonical_coin,
+        "base_name": resolved["base_name"],
+        "quote_name": resolved["quote_name"],
+        "sz_decimals": resolved["sz_decimals"],
         "bid": bid,
         "ask": ask,
         "mid": (bid + ask) / 2.0,
@@ -117,6 +158,65 @@ def fetch_spot_market_info(coin: str, base_url: str = HL_MAINNET_API) -> Dict[st
 def fetch_spot_mid_price(coin: str, base_url: str = HL_MAINNET_API) -> float:
     """Fetch current spot mid price from Hyperliquid public /info endpoint."""
     return fetch_spot_market_info(coin, base_url=base_url)["mid"]
+
+
+def fetch_spot_available_balances(account_address: str, base_url: str = HL_MAINNET_API) -> Dict[str, float]:
+    """Return available (total - hold) Spot balances by token symbol."""
+    spot_state = hl_info_post(
+        {"type": "spotClearinghouseState", "user": account_address},
+        base_url=base_url,
+    )
+    available: Dict[str, float] = {}
+    for b in spot_state.get("balances", []):
+        coin = b.get("coin")
+        total = float(b.get("total", 0.0) or 0.0)
+        hold = float(b.get("hold", 0.0) or 0.0)
+        if coin:
+            available[coin] = max(0.0, total - hold)
+    return available
+
+
+def filter_orders_by_spot_balances(
+    buy_orders: List[Dict[str, Any]],
+    sell_orders: List[Dict[str, Any]],
+    usdc_available: float,
+    base_available: float,
+) -> Dict[str, Any]:
+    """
+    Select only orders funded by current Spot balances (closest to market price first).
+    Allows starting cleanly with 100% USDC: buys deploy below market, and sells appear
+    automatically as buys fill.
+    """
+    funded_buys: List[Dict[str, Any]] = []
+    skipped_buys = 0
+    rem_usdc = usdc_available
+    # Closest buy orders to current market price first (highest limit_px first)
+    for o in sorted(buy_orders, key=lambda x: x["limit_px"], reverse=True):
+        needed_usdc = o["sz"] * o["limit_px"]
+        if needed_usdc <= rem_usdc + 1e-9:
+            funded_buys.append(o)
+            rem_usdc -= needed_usdc
+        else:
+            skipped_buys += 1
+
+    funded_sells: List[Dict[str, Any]] = []
+    skipped_sells = 0
+    rem_base = base_available
+    # Closest sell orders to current market price first (lowest limit_px first)
+    for o in sorted(sell_orders, key=lambda x: x["limit_px"]):
+        needed_base = o["sz"]
+        if needed_base <= rem_base + 1e-12:
+            funded_sells.append(o)
+            rem_base -= needed_base
+        else:
+            skipped_sells += 1
+
+    return {
+        "buy_orders": sorted(funded_buys, key=lambda x: x["limit_px"]),
+        "sell_orders": sorted(funded_sells, key=lambda x: x["limit_px"]),
+        "skipped_buys": skipped_buys,
+        "skipped_sells": skipped_sells,
+    }
 
 
 def check_builder_status(builder_address: str = DEFAULT_BUILDER_WALLET, base_url: str = HL_MAINNET_API) -> Dict[str, Any]:
@@ -390,6 +490,7 @@ class GridBotRunner:
         coin: str,
         levels: List[float],
         capital: float,
+        base_name: str = "",
         sz_decimals: int = 2,
         fee_bps: int = DEFAULT_FEE_BPS,
         builder_address: str = DEFAULT_BUILDER_WALLET,
@@ -400,6 +501,7 @@ class GridBotRunner:
         self.exchange = exchange
         self.account_address = account_address.lower()
         self.coin = coin
+        self.base_name = base_name
         self.levels = sorted(levels)
         self.capital = capital
         self.sz_decimals = sz_decimals
@@ -448,8 +550,12 @@ class GridBotRunner:
         required_f = self.builder_payload["f"]
         return approved_int >= required_f, approved_int
 
-    def deploy_initial_grid(self, current_price: float) -> Dict[str, Any]:
-        """Place the initial set of Post-Only grid orders on Hyperliquid."""
+    def deploy_initial_grid(
+        self,
+        current_price: float,
+        available_balances: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, Any]:
+        """Place the initial set of Post-Only grid orders funded by current Spot balances."""
         plan = generate_initial_grid_orders(
             coin=self.coin,
             levels=self.levels,
@@ -465,9 +571,26 @@ class GridBotRunner:
                 f"Hyperliquid minimum (${MIN_ORDER_NOTIONAL_USD:.2f})."
             )
 
+        skipped_buys = 0
+        skipped_sells = 0
+        if available_balances is not None:
+            filtered = filter_orders_by_spot_balances(
+                buy_orders=plan["buy_orders"],
+                sell_orders=plan["sell_orders"],
+                usdc_available=available_balances.get("USDC", 0.0),
+                base_available=available_balances.get(self.base_name, 0.0),
+            )
+            plan["buy_orders"] = filtered["buy_orders"]
+            plan["sell_orders"] = filtered["sell_orders"]
+            skipped_buys = filtered["skipped_buys"]
+            skipped_sells = filtered["skipped_sells"]
+
         all_orders = plan["buy_orders"] + plan["sell_orders"]
         if not all_orders:
-            raise ValueError("No valid orders generated for given levels and current price.")
+            raise ValueError(
+                "No orders could be placed with current Spot balances. "
+                "Ensure you have enough Spot USDC (for buy levels) or base asset (for sell levels)."
+            )
 
         # Seed processed_tids with existing fills so we only react to NEW fills after startup
         existing_fills = self.info.user_fills(self.account_address) or []
@@ -478,14 +601,18 @@ class GridBotRunner:
 
         sdk_orders = [to_sdk_order_request(o) for o in all_orders]
         res = self.exchange.bulk_orders(sdk_orders, builder=self.builder_payload)
-        return {"plan": plan, "exchange_response": res}
+        return {
+            "plan": plan,
+            "skipped_buys": skipped_buys,
+            "skipped_sells": skipped_sells,
+            "exchange_response": res,
+        }
 
     def sync_fills_once(self) -> List[Dict[str, Any]]:
         """Poll recent fills for this coin and submit counter-orders on adjacent grid levels."""
         fills = self.info.user_fills(self.account_address) or []
         placed: List[Dict[str, Any]] = []
 
-        # Process oldest new fills first
         coin_fills = [f for f in fills if f.get("coin") == self.coin]
         coin_fills.sort(key=lambda x: x.get("time", 0))
 
@@ -562,7 +689,7 @@ def _build_sdk_clients(private_key: str, account_address: Optional[str], base_ur
     return info, exchange, resolved_account
 
 
-def run_approve_builder(fee_bps: int, builder_address: str, base_url: str) -> None:
+def run_approve_builder(fee_bps: int, base_url: str) -> None:
     """Sign and submit one-time ApproveBuilderFee using HL_MAIN_PRIVATE_KEY."""
     main_key = os.environ.get("HL_MAIN_PRIVATE_KEY", "").strip()
     if not main_key:
@@ -579,25 +706,25 @@ def run_approve_builder(fee_bps: int, builder_address: str, base_url: str) -> No
 
     _, exchange, account = _build_sdk_clients(main_key, None, base_url)
     max_rate = bps_to_max_fee_rate_str(fee_bps)
-    print(f"Approving builder {builder_address.lower()} up to {max_rate} for main wallet {account}...")
-    resp = exchange.approve_builder_fee(builder=builder_address.lower(), max_fee_rate=max_rate)
+    print(f"Approving builder {DEFAULT_BUILDER_WALLET} up to {max_rate} for main wallet {account}...")
+    resp = exchange.approve_builder_fee(builder=DEFAULT_BUILDER_WALLET, max_fee_rate=max_rate)
     print("Hyperliquid response:", json.dumps(resp, indent=2))
 
 
-def run_check_builder(builder_address: str, base_url: str) -> None:
-    """Print protocol eligibility report for the builder address."""
-    st = check_builder_status(builder_address=builder_address, base_url=base_url)
+def run_check_builder(base_url: str) -> None:
+    """Print protocol eligibility report for the project builder address."""
+    st = check_builder_status(builder_address=DEFAULT_BUILDER_WALLET, base_url=base_url)
     print("==================================================================")
     print("  HYPERLIQUID BUILDER CODE ELIGIBILITY CHECK (HIP-1)")
     print("==================================================================")
     print(f"Builder Address:       {st['builder']}")
-    print(f"Account Mode:          {st['abstraction_mode']} ({'OK' if st['is_standard_mode'] else 'MUST BE standard'})")
+    print(f"Account Mode:          {st['abstraction_mode']} ({'OK' if st['is_standard_mode'] else 'MUST BE Manual/standard'})")
     print(f"Perp Account Value:    ${st['perp_account_value']:,.2f} USDC (Requires >= $100.00)")
     print(f"Spot USDC Balance:     ${st['spot_usdc']:,.2f} USDC")
     print(f"Builder Eligible Now:  {'YES' if st['eligible'] else 'NO'}")
     if not st["is_standard_mode"]:
-        print("\n[ACTION REQUIRED] Disable Unified Account / Portfolio Margin in Hyperliquid Settings")
-        print("                  (switch to Standard mode) to collect Builder Fees.")
+        print("\n[ACTION REQUIRED] Switch Account Type to Manual (Standard) in Hyperliquid Portfolio")
+        print("                  to collect Builder Fees.")
     if not st["has_min_perp_usdc"]:
         missing = max(0.0, 100.0 - st["perp_account_value"])
         print(f"\n[ACTION REQUIRED] Hold at least $100.00 USDC in Perps (missing ${missing:,.2f} USDC).")
@@ -614,12 +741,14 @@ def run_live_bot(args: argparse.Namespace, base_url: str) -> None:
             "For security, create a Hyperliquid API Wallet (Agent) with NO withdrawal permissions:\n"
             "  export HL_PRIVATE_KEY=0x<agent_private_key>\n"
             "  export HL_ACCOUNT_ADDRESS=0x<your_main_wallet_address>\n"
-            "  python spot_grid_bot.py --run --coin @107 --lower 20 --upper 40 --grids 8 --capital 100",
+            "  python spot_grid_bot.py --run --coin HYPE/USDC --lower 50 --upper 80 --grids 8 --capital 100",
             file=sys.stderr,
         )
         sys.exit(1)
 
     market = fetch_spot_market_info(args.coin, base_url=base_url)
+    canonical_coin = market["coin"]
+    base_name = market["base_name"]
     sz_decimals = market["sz_decimals"]
     current_price = market["mid"]
     levels = calculate_grid_levels(
@@ -631,12 +760,13 @@ def run_live_bot(args: argparse.Namespace, base_url: str) -> None:
         info=info,
         exchange=exchange,
         account_address=resolved_account,
-        coin=args.coin,
+        coin=canonical_coin,
+        base_name=base_name,
         levels=levels,
         capital=args.capital,
         sz_decimals=sz_decimals,
         fee_bps=args.fee_bps,
-        builder_address=args.builder,
+        builder_address=DEFAULT_BUILDER_WALLET,
         state_file=args.state_file,
         base_url=base_url,
     )
@@ -646,7 +776,7 @@ def run_live_bot(args: argparse.Namespace, base_url: str) -> None:
         if not ok:
             print(
                 f"[ERROR] Wallet {resolved_account} has approved f={approved_f} for builder "
-                f"{args.builder.lower()}, but this run requires f={bps_to_hl_builder_f(args.fee_bps)} "
+                f"{DEFAULT_BUILDER_WALLET}, but this run requires f={bps_to_hl_builder_f(args.fee_bps)} "
                 f"({args.fee_bps} bps).\n"
                 "Run once with your main wallet:\n"
                 f"  HL_MAIN_PRIVATE_KEY=0x... python spot_grid_bot.py --approve-builder --fee-bps {args.fee_bps}",
@@ -654,9 +784,24 @@ def run_live_bot(args: argparse.Namespace, base_url: str) -> None:
             )
             sys.exit(1)
 
-    print(f"Live market {args.coin} ({market['base_name']}): mid={current_price:.4f}, szDecimals={sz_decimals}")
-    deployed = runner.deploy_initial_grid(current_price=current_price)
-    print(format_grid_plan(deployed["plan"], args.coin, current_price))
+    balances = fetch_spot_available_balances(resolved_account, base_url=base_url)
+    print(
+        f"Live market {base_name}/USDC ({canonical_coin}): mid={current_price:.4f}, "
+        f"szDecimals={sz_decimals} | Spot Available: "
+        f"{balances.get('USDC', 0.0):.2f} USDC, {balances.get(base_name, 0.0):.5f} {base_name}"
+    )
+
+    deployed = runner.deploy_initial_grid(current_price=current_price, available_balances=balances)
+    if deployed["skipped_sells"] > 0:
+        print(
+            f"[INFO] Skipped {deployed['skipped_sells']} upper SELL level(s) due to insufficient "
+            f"{base_name} balance — upper SELL orders will be placed automatically as BUY orders fill."
+        )
+    if deployed["skipped_buys"] > 0:
+        print(
+            f"[INFO] Skipped {deployed['skipped_buys']} lower BUY level(s) due to available Spot USDC."
+        )
+    print(format_grid_plan(deployed["plan"], f"{base_name}/USDC ({canonical_coin})", current_price))
     print("Initial deployment response:", json.dumps(deployed["exchange_response"], indent=2))
 
     stop_flag = {"stop": False}
@@ -688,13 +833,13 @@ def run_live_bot(args: argparse.Namespace, base_url: str) -> None:
 
     if args.cancel_on_exit:
         n = runner.cancel_all_coin_orders()
-        print(f"Cancelled {n} open order(s) for {args.coin} on exit.")
+        print(f"Cancelled {n} open order(s) for {canonical_coin} on exit.")
     print("Shutdown complete.")
 
 
-def main() -> None:
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Hyperliquid Spot Grid Trading Bot (Non-Custodial)")
-    parser.add_argument("--coin", type=str, default="@107", help="Spot market symbol (e.g. @107 for HYPE, @142 for UBTC, PURR/USDC)")
+    parser.add_argument("--coin", type=str, default="HYPE/USDC", help="Spot pair (e.g. HYPE/USDC, @107, UBTC/USDC, PURR/USDC)")
     parser.add_argument("--lower", type=float, default=50.0, help="Lower price boundary (USD)")
     parser.add_argument("--upper", type=float, default=80.0, help="Upper price boundary (USD)")
     parser.add_argument("--grids", type=int, default=8, help="Number of grid levels")
@@ -703,7 +848,6 @@ def main() -> None:
     parser.add_argument("--price", type=float, default=None, help="Override reference market price (USD) in --plan mode")
     parser.add_argument("--live-price", action="store_true", help="Fetch live spot mid price & szDecimals from Hyperliquid public API")
     parser.add_argument("--fee-bps", type=int, default=DEFAULT_FEE_BPS, help="Builder fee in bps (default 5 = 0.05%%)")
-    parser.add_argument("--builder", type=str, default=DEFAULT_BUILDER_WALLET, help="Builder fee recipient address")
     parser.add_argument("--testnet", action="store_true", help="Use Hyperliquid Testnet instead of Mainnet")
     parser.add_argument("--poll-interval", type=int, default=10, help="Seconds between fill checks in --run mode")
     parser.add_argument("--state-file", type=str, default="grid_state.json", help="Path to local state file")
@@ -714,16 +858,20 @@ def main() -> None:
     action_group.add_argument("--check-builder", action="store_true", help="Check Hyperliquid HIP-1 eligibility for builder wallet")
     action_group.add_argument("--approve-builder", action="store_true", help="Sign one-time ApproveBuilderFee using HL_MAIN_PRIVATE_KEY")
     action_group.add_argument("--run", action="store_true", help="Run live grid bot using HL_PRIVATE_KEY (API/Agent wallet)")
-    args = parser.parse_args()
+    return parser
 
+
+def main() -> None:
+    parser = build_arg_parser()
+    args = parser.parse_args()
     base_url = HL_TESTNET_API if args.testnet else HL_MAINNET_API
 
     if args.check_builder:
-        run_check_builder(args.builder, base_url=base_url)
+        run_check_builder(base_url=base_url)
         return
 
     if args.approve_builder:
-        run_approve_builder(args.fee_bps, args.builder, base_url=base_url)
+        run_approve_builder(args.fee_bps, base_url=base_url)
         return
 
     if args.run:
@@ -732,9 +880,11 @@ def main() -> None:
 
     # Default: --plan dry-run mode
     sz_decimals = 4
+    display_coin = args.coin
     if args.live_price:
         market = fetch_spot_market_info(args.coin, base_url=base_url)
         sz_decimals = market["sz_decimals"]
+        display_coin = f"{market['base_name']}/USDC ({market['coin']})"
         current_price = args.price if args.price is not None else market["mid"]
         levels = calculate_grid_levels(
             args.lower, args.upper, args.grids, mode=args.mode, sz_decimals=sz_decimals
@@ -756,10 +906,10 @@ def main() -> None:
         current_price=current_price,
         total_capital=args.capital,
         fee_bps=args.fee_bps,
-        builder_address=args.builder,
+        builder_address=DEFAULT_BUILDER_WALLET,
         sz_decimals=sz_decimals,
     )
-    print(format_grid_plan(plan, args.coin, current_price))
+    print(format_grid_plan(plan, display_coin, current_price))
 
 
 if __name__ == "__main__":

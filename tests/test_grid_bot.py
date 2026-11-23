@@ -8,6 +8,39 @@ import spot_grid_bot as SGB
 
 BUILDER_WALLET = "0x3f294E8CFc89B9f0Df5608D601fBaCf385E6DbEc".lower()
 
+SAMPLE_SPOT_META = {
+    "tokens": [
+        {"index": 0, "name": "USDC", "szDecimals": 8},
+        {"index": 1, "name": "PURR", "szDecimals": 0},
+        {"index": 150, "name": "HYPE", "szDecimals": 2},
+        {"index": 197, "name": "UBTC", "szDecimals": 5},
+    ],
+    "universe": [
+        {"name": "PURR/USDC", "tokens": [1, 0]},
+        {"name": "@107", "tokens": [150, 0]},
+        {"name": "@142", "tokens": [197, 0]},
+    ],
+}
+
+
+def test_resolve_spot_pair_friendly_and_canonical_names():
+    assert SGB.resolve_spot_pair("@107", SAMPLE_SPOT_META)["coin"] == "@107"
+    hype = SGB.resolve_spot_pair("HYPE/USDC", SAMPLE_SPOT_META)
+    assert hype["coin"] == "@107"
+    assert hype["base_name"] == "HYPE"
+    assert hype["sz_decimals"] == 2
+
+    ubtc = SGB.resolve_spot_pair("ubtc", SAMPLE_SPOT_META)
+    assert ubtc["coin"] == "@142"
+    assert ubtc["sz_decimals"] == 5
+
+    purr = SGB.resolve_spot_pair("PURR/USDC", SAMPLE_SPOT_META)
+    assert purr["coin"] == "PURR/USDC"
+    assert purr["sz_decimals"] == 0
+
+    with pytest.raises(ValueError):
+        SGB.resolve_spot_pair("UNKNOWN/USDC", SAMPLE_SPOT_META)
+
 
 def test_calculate_geometric_grid_levels():
     levels = SGB.calculate_grid_levels(100.0, 150.0, 5, mode="geometric")
@@ -34,7 +67,6 @@ def test_calculate_grid_levels_rejects_invalid_inputs():
 
 
 def test_spot_price_and_size_rounding():
-    # HYPE (@107) has szDecimals=2 -> max 6 decimals, 5 sig figs
     assert SGB.round_spot_price(25.123456, sz_decimals=2) == 25.123
     assert SGB.round_spot_price(61234.56, sz_decimals=5) == 61235.0
     assert SGB.round_size(1.2399, sz_decimals=2) == 1.23
@@ -71,6 +103,12 @@ def test_build_order_payload_includes_builder_fee_in_tenths_of_bps():
     assert order["builder"] == {"b": BUILDER_WALLET, "f": 50}
 
 
+def test_cli_parser_does_not_expose_builder_override():
+    parser = SGB.build_arg_parser()
+    option_strings = {opt for action in parser._actions for opt in action.option_strings}
+    assert "--builder" not in option_strings
+
+
 def test_grid_initial_distribution_and_min_notional_warning():
     levels = [50.0, 60.0, 70.0, 80.0, 90.0]
     plan = SGB.generate_initial_grid_orders(
@@ -99,10 +137,31 @@ def test_grid_initial_distribution_and_min_notional_warning():
     assert "[WARNING]" in SGB.format_grid_plan(small_plan, "@107", 68.0)
 
 
+def test_filter_orders_by_spot_balances_usdc_only():
+    levels = [50.0, 60.0, 70.0, 80.0]
+    plan = SGB.generate_initial_grid_orders(
+        coin="@107",
+        levels=levels,
+        current_price=65.0,
+        total_capital=100.0,
+        sz_decimals=2,
+    )
+    # User starts with $50 USDC and 0 HYPE -> both buys (~$25 each) funded, both sells skipped
+    filtered = SGB.filter_orders_by_spot_balances(
+        buy_orders=plan["buy_orders"],
+        sell_orders=plan["sell_orders"],
+        usdc_available=55.0,
+        base_available=0.0,
+    )
+    assert len(filtered["buy_orders"]) == 2
+    assert len(filtered["sell_orders"]) == 0
+    assert filtered["skipped_buys"] == 0
+    assert filtered["skipped_sells"] == 2
+
+
 def test_compute_counter_order_on_fill():
     levels = [50.0, 60.0, 70.0, 80.0]
 
-    # Buy filled at 60 -> place SELL at 70
     sell_counter = SGB.compute_counter_order_on_fill(
         coin="@107",
         levels=levels,
@@ -119,7 +178,6 @@ def test_compute_counter_order_on_fill():
     assert sell_counter["sz"] == 0.5
     assert sell_counter["builder"]["f"] == 50
 
-    # Sell filled at 70 -> place BUY at 60
     buy_counter = SGB.compute_counter_order_on_fill(
         coin="@107",
         levels=levels,
@@ -134,14 +192,12 @@ def test_compute_counter_order_on_fill():
     assert buy_counter["is_buy"] is True
     assert buy_counter["limit_px"] == 60.0
 
-    # Boundary: Buy filled at top level (80) -> no upper level
     assert (
         SGB.compute_counter_order_on_fill(
             coin="@107", levels=levels, fill_is_buy=True, fill_price=80.0, fill_sz=0.5
         )
         is None
     )
-    # Boundary: Sell filled at bottom level (50) -> no lower level
     assert (
         SGB.compute_counter_order_on_fill(
             coin="@107", levels=levels, fill_is_buy=False, fill_price=50.0, fill_sz=0.5
@@ -191,7 +247,7 @@ class _FakeExchange:
         return {"status": "ok"}
 
 
-def test_grid_bot_runner_deploy_rebalance_dedupe_and_cancel(tmp_path):
+def test_grid_bot_runner_deploy_balance_aware_rebalance_dedupe_and_cancel(tmp_path):
     state_path = tmp_path / "state.json"
     info = _FakeInfo(
         fills=[{"coin": "@107", "tid": 1, "side": "B", "px": "60.0", "sz": "0.5", "time": 1000}],
@@ -207,6 +263,7 @@ def test_grid_bot_runner_deploy_rebalance_dedupe_and_cancel(tmp_path):
         exchange=ex,
         account_address="0x1111111111111111111111111111111111111111",
         coin="@107",
+        base_name="HYPE",
         levels=[50.0, 60.0, 70.0, 80.0],
         capital=100.0,
         sz_decimals=2,
@@ -215,12 +272,17 @@ def test_grid_bot_runner_deploy_rebalance_dedupe_and_cancel(tmp_path):
         state_file=str(state_path),
     )
 
-    # 1. Deploy initial grid (seeds pre-existing tid=1 so it won't re-trigger)
-    deployed = runner.deploy_initial_grid(current_price=65.0)
+    # 1. Deploy initial grid with 100% USDC (0 HYPE): places 2 BUYs and skips 2 upper SELLs cleanly
+    deployed = runner.deploy_initial_grid(
+        current_price=65.0,
+        available_balances={"USDC": 100.0, "HYPE": 0.0},
+    )
     assert deployed["exchange_response"]["status"] == "ok"
+    assert deployed["skipped_sells"] == 2
     assert len(ex.bulk_calls) == 1
     assert ex.bulk_calls[0]["builder"] == {"b": BUILDER_WALLET, "f": 50}
-    assert len(ex.bulk_calls[0]["orders"]) == 4
+    assert len(ex.bulk_calls[0]["orders"]) == 2
+    assert all(o["is_buy"] is True for o in ex.bulk_calls[0]["orders"])
 
     # 2. Pre-existing fill tid=1 is ignored
     assert runner.sync_fills_once() == []
