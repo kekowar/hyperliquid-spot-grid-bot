@@ -27,10 +27,10 @@ pip install -r requirements.txt
 Preview exact tick-rounded grid levels and per-order capital before risking funds:
 ```bash
 # Offline simulation
-python spot_grid_bot.py --plan --coin HYPE/USDC --lower 50 --upper 80 --grids 8 --capital 100
+python3 spot_grid_bot.py --plan --coin HYPE/USDC --lower 50 --upper 80 --grids 8 --capital 100
 
 # Live mid-price & szDecimals directly from Hyperliquid public API
-python spot_grid_bot.py --plan --coin HYPE/USDC --lower 50 --upper 80 --grids 8 --capital 100 --live-price
+python3 spot_grid_bot.py --plan --coin HYPE/USDC --lower 50 --upper 80 --grids 8 --capital 100 --live-price
 ```
 
 ### 3. Live Execution Setup (2 One-Time Steps)
@@ -39,7 +39,7 @@ python spot_grid_bot.py --plan --coin HYPE/USDC --lower 50 --upper 80 --grids 8 
 Hyperliquid requires every user to authorize a builder's max fee cap once via an EIP-712 `ApproveBuilderFee` signature from their **Main Wallet** (revocable at any time):
 ```bash
 export HL_MAIN_PRIVATE_KEY="0x<your_main_wallet_key>"
-python spot_grid_bot.py --approve-builder --fee-bps 5
+python3 spot_grid_bot.py --approve-builder --fee-bps 5
 unset HL_MAIN_PRIVATE_KEY
 ```
 
@@ -49,7 +49,7 @@ Create an API Wallet in Hyperliquid (`More -> API`), then run the bot with that 
 export HL_PRIVATE_KEY="0x<your_api_agent_private_key>"
 export HL_ACCOUNT_ADDRESS="0x<your_main_wallet_address>"
 
-python spot_grid_bot.py --run \
+python3 spot_grid_bot.py --run \
   --coin HYPE/USDC \
   --lower 50 \
   --upper 80 \
@@ -111,21 +111,21 @@ pip install -r requirements.txt
 
 ### 2. 模拟测算网格（Dry-Run，无需私钥）
 ```bash
-python spot_grid_bot.py --plan --coin HYPE/USDC --lower 50 --upper 80 --grids 8 --capital 100 --live-price
+python3 spot_grid_bot.py --plan --coin HYPE/USDC --lower 50 --upper 80 --grids 8 --capital 100 --live-price
 ```
 
 ### 3. 实盘运行（仅需两步）
 1. **一次性授权 Builder Fee（需主钱包签名一次，可随时撤销）：**
    ```bash
    export HL_MAIN_PRIVATE_KEY="0x<你的主钱包私钥>"
-   python spot_grid_bot.py --approve-builder --fee-bps 5
+   python3 spot_grid_bot.py --approve-builder --fee-bps 5
    unset HL_MAIN_PRIVATE_KEY
    ```
 2. **使用 API/Agent 钱包运行自动网格：**
    ```bash
    export HL_PRIVATE_KEY="0x<API_Agent_私钥>"
    export HL_ACCOUNT_ADDRESS="0x<主钱包地址>"
-   python spot_grid_bot.py --run --coin HYPE/USDC --lower 50 --upper 80 --grids 8 --capital 120 --cancel-on-exit
+   python3 spot_grid_bot.py --run --coin HYPE/USDC --lower 50 --upper 80 --grids 8 --capital 120 --cancel-on-exit
    ```
 
 ### 4. 协议原生 Builder Fee（HIP-1）
@@ -156,21 +156,21 @@ pip install -r requirements.txt
 
 ### 2. Simular tu Rejilla (Dry-Run, sin claves)
 ```bash
-python spot_grid_bot.py --plan --coin HYPE/USDC --lower 50 --upper 80 --grids 8 --capital 100 --live-price
+python3 spot_grid_bot.py --plan --coin HYPE/USDC --lower 50 --upper 80 --grids 8 --capital 100 --live-price
 ```
 
 ### 3. Puesta en Marcha en Vivo (2 pasos)
 1. **Aprobar el Builder Fee una sola vez (con tu Main Wallet):**
    ```bash
    export HL_MAIN_PRIVATE_KEY="0x<clave_de_tu_main_wallet>"
-   python spot_grid_bot.py --approve-builder --fee-bps 5
+   python3 spot_grid_bot.py --approve-builder --fee-bps 5
    unset HL_MAIN_PRIVATE_KEY
    ```
 2. **Ejecutar el Grid Bot con una API Wallet (Agent sin permisos de retiro):**
    ```bash
    export HL_PRIVATE_KEY="0x<clave_api_agent>"
    export HL_ACCOUNT_ADDRESS="0x<tu_direccion_main_wallet>"
-   python spot_grid_bot.py --run --coin HYPE/USDC --lower 50 --upper 80 --grids 8 --capital 120 --cancel-on-exit
+   python3 spot_grid_bot.py --run --coin HYPE/USDC --lower 50 --upper 80 --grids 8 --capital 120 --cancel-on-exit
    ```
 
 > **Nota:** Hyperliquid exige un mínimo de **$10 USDC por orden** en Spot (`capital / grids >= 10`). Puedes probar antes con `--testnet`.
